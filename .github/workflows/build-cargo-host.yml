@@ -1,0 +1,135 @@
+name: build-cargo-host
+on:
+  workflow_dispatch:
+    inputs:
+      gitref_to_build:
+        description: "gitref tag or hash to build"
+        default: master
+        required: true
+        type: string
+      buildos:
+        description: "docker image to build with"
+        default: resolute
+        required: true
+        type: choice
+        options:
+          - resolute
+      target:
+        description: "targets to build"
+        default: all
+        required: true
+        type: choice
+        options:
+          - all
+          - x86_64
+          - aarch64
+          - armv7ve
+          - armv7a
+          - armv6zk
+  schedule:
+    # The times are specified in UTC
+    - cron: "15 13 * * *"
+
+env:
+  debug: debug
+  ephemeral: ephemeral
+
+jobs:
+  check_build_tools:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    name: Checkout LibreELEC.tv and create the release
+    outputs:
+      rust: ${{ steps.tool_version.outputs.rust }}
+      osver: ${{ steps.tool_version.outputs.osver }}
+      upload_url: ${{ steps.release.outputs.upload_url }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      # one archive per host and TARGET_NAME. aarch64 and armv7a are built with
+      # ARM/ARMv8 and ARM/ARMv7, the devices the addons are built with, and
+      # ARMv8 is armv8-a, the baseline for every aarch64-libreelec-linux-gnu
+      # device including RPi5's armv8.2-a
+      - id: matrix
+        name: select the targets to build
+        env:
+          TARGET: ${{ github.event.inputs.target || 'all' }}
+        run: |
+          python3 - <<'EOF' >> "${GITHUB_OUTPUT}"
+          import json, os
+          builds = [
+            {"host": "x86_64", "runner": "ubuntu-latest", "target": "x86_64", "project": "Generic", "arch": "x86_64", "device": ""},
+            {"host": "x86_64", "runner": "ubuntu-latest", "target": "aarch64", "project": "ARM", "arch": "aarch64", "device": "ARMv8"},
+            {"host": "x86_64", "runner": "ubuntu-latest", "target": "armv7ve", "project": "RPi", "arch": "arm", "device": "RPi2"},
+            {"host": "x86_64", "runner": "ubuntu-latest", "target": "armv7a", "project": "ARM", "arch": "arm", "device": "ARMv7"},
+            {"host": "x86_64", "runner": "ubuntu-latest", "target": "armv6zk", "project": "RPi", "arch": "arm", "device": "RPi"},
+            {"host": "aarch64", "runner": "ubuntu-24.04-arm", "target": "x86_64", "project": "Generic", "arch": "x86_64", "device": ""},
+            {"host": "aarch64", "runner": "ubuntu-24.04-arm", "target": "aarch64", "project": "ARM", "arch": "aarch64", "device": "ARMv8"},
+            {"host": "aarch64", "runner": "ubuntu-24.04-arm", "target": "armv7ve", "project": "RPi", "arch": "arm", "device": "RPi2"},
+            {"host": "aarch64", "runner": "ubuntu-24.04-arm", "target": "armv7a", "project": "ARM", "arch": "arm", "device": "ARMv7"},
+            {"host": "aarch64", "runner": "ubuntu-24.04-arm", "target": "armv6zk", "project": "RPi", "arch": "arm", "device": "RPi"},
+          ]
+          target = os.environ["TARGET"]
+          selected = [b for b in builds if target == "all" or b["target"] == target]
+          print("matrix=" + json.dumps({"include": selected}))
+          EOF
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          path: "cargo-reusable"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.gitref_to_build || 'master' }}
+          fetch-depth: 2
+          repository: "${{ github.repository_owner }}/LibreELEC.tv"
+          path: "LibreELEC.tv"
+      - id: tool_version
+        name: get versions of LibreELEC and rust
+        run: |
+          cd LibreELEC.tv
+          echo "rust:host and cargo:host build - $(git rev-parse HEAD)" > build-log.txt
+          echo "=====================" >> build-log.txt
+          tools/viewplan cargo:host >> build-log.txt
+          . config/options
+          echo "rust=$(get_pkg_version rust)" >> $GITHUB_OUTPUT
+          echo "osver=${OS_VERSION}" >> $GITHUB_OUTPUT
+      # the release holds one archive per host and target, and each archive is
+      # named after its recipes, so a release that already exists is reused and
+      # every build job checks for its own archive instead
+      - id: release
+        name: create or reuse the release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: false
+          prerelease: true
+          name: "reusable rust:host and cargo:host for LibreELEC-${{ steps.tool_version.outputs.osver }} with rust-${{ steps.tool_version.outputs.rust }}"
+          tag_name: ${{ steps.tool_version.outputs.osver }}-${{ steps.tool_version.outputs.rust }}
+          body_path: cargo-reusable/CHANGELOG.md
+          fail_on_unmatched_files: true
+          files: |
+            LibreELEC.tv/build-log.txt
+
+  build:
+    permissions:
+      contents: write
+    name: "${{ matrix.host }} host, ${{ matrix.target }} target"
+    needs: check_build_tools
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.check_build_tools.outputs.matrix) }}
+    uses: ./.github/workflows/yml-build-cargo-host.yml
+    with:
+      runner: ${{ matrix.runner }}
+      debug: debug
+      ephemeral: ephemeral
+      upload_url: ${{ needs.check_build_tools.outputs.upload_url }}
+      buildcmd: "scripts/build_mt cargo:host"
+      gitref: ${{ github.event.inputs.gitref_to_build || 'master' }}
+      group: ${{ matrix.host }}-${{ matrix.target }}-cargo
+      project: ${{ matrix.project }}
+      arch: ${{ matrix.arch }}
+      device: ${{ matrix.device }}
+      version: ${{ needs.check_build_tools.outputs.osver }}
+      rust: ${{ needs.check_build_tools.outputs.rust }}
+      buildos: ${{ github.event.inputs.buildos || 'resolute' }}
+    secrets: inherit
